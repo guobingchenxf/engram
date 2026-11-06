@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemPoison submission",
+  "type": "object",
+  "required": ["name", "defense", "dataset_version", "metrics"],
+  "properties": {
+    "name": {"type": "string"},
+    "defense": {"type": "string"},
+    "dataset_version": {"const": "mempoison-0.1"},
+    "split": {"type": "string", "default": "full"},
+    "metrics": {
+      "type": "object",
+      "required": ["asr", "ur", "fpr"],
+      "properties": {
+        "asr": {"type": "number", "minimum": 0, "maximum": 1},
+        "ur": {"type": "number", "minimum": 0, "maximum": 1},
+        "fpr": {"type": "number", "minimum": 0, "maximum": 1},
+        "detection_rate": {"type": "number", "minimum": 0, "maximum": 1},
+        "adaptive_asr": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "case_results": {"type": "array", "items": {"type": "object"}},
+    "notes": {"type": "string"}
+  }
+}

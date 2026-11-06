@@ -1,0 +1,15 @@
+{
+  "name": "engram-provenance-reference",
+  "defense": "provenance",
+  "dataset_version": "mempoison-0.1",
+  "split": "full",
+  "metrics": {
+    "asr": 0.1,
+    "ur": 0.9,
+    "fpr": 0.0,
+    "detection_rate": 0.9,
+    "adaptive_asr": 1.0
+  },
+  "case_results": [],
+  "notes": "Reference numbers from the deterministic victim. Adaptive ASR is high because the adaptive split forges provenance."
+}
