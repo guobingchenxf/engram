@@ -16,12 +16,16 @@ system built around five operations:
 4. **forget** — TTL, decay, pruning and explicit deletion;
 5. **evaluate** — MemPoison and a 23-scenario lifecycle benchmark.
 
-> **Status (2026-11-05):** Trustworthy Memory repositioning complete — 64 tests,
-> ruff and mypy clean. Primary evidence: **MemPoison**, an open 120-case
-> cross-session memory-poisoning benchmark. Base-set ASR: `none` 100%,
+> **Status (2026-11-06):** Trustworthy Memory repositioning plus a production
+> write-path pass — **115 tests**, ruff and mypy clean. The write path now has
+> one guard for `write`/`import`/`patch`, HMAC-SHA256 signed provenance with
+> recursive parent verification, tenant-scoped storage, and a per-tenant
+> tamper-evident audit hash chain. Primary evidence: **MemPoison**, an open
+> 120-case cross-session memory-poisoning benchmark. All-120 ASR: `none` 100%,
 > `source_trust` 40%, `classifier` 5% (FPR 25%), `isolation` 40%,
-> `provenance` 10%. The adaptive split defeats every current defense, including
-> provenance (forged parent). Secondary evidence: lifecycle benchmark memory
+> `provenance` 10%; base-only ASR: source_trust 33.3%, classifier 2.8%,
+> provenance 0%. The adaptive split defeats source-trust, isolation and
+> self-declared provenance. Secondary evidence: lifecycle benchmark memory
 > **23/23** vs full-history **5/23**; red-team **12/12**. Synthetic,
 > reproducible, not a vendor comparison or external validation.
 > Positioning and non-goals: [docs/POSITIONING.md](docs/POSITIONING.md).
@@ -65,6 +69,13 @@ general-purpose RAG stack.
 - **Memory types**: working, episodic, semantic, procedural.
 - **Provenance and trust**: user / agent / tool / web / email / other user /
   system; untrusted sources cannot write durable semantic memory by default.
+- **Signed provenance**: HMAC-SHA256 attestations bind tenant, user, content,
+  type, source, sensitivity and the parent chain; verification is recursive and
+  rejects forged/missing/tampered parents. See [docs/ATTESTATION.md](docs/ATTESTATION.md).
+- **Tenant isolation**: every memory, conflict and audit event is scoped by
+  `tenant_id`; cross-tenant reads, mutations and imports are rejected.
+- **Tamper-evident audit**: per-tenant SHA-256 hash chain with
+  `GET /v1/audit/verify`, `GET /v1/audit/head` and `engram audit-verify`.
 - **Hybrid retrieval**: BM25 + embeddings + recency + importance + confidence,
   with MMR diversity and a token budget.
 - **Conflict lifecycle**: explicit changes supersede old memories; contradictions
@@ -91,6 +102,35 @@ general-purpose RAG stack.
 - **Benchmark**: 23 multi-session scenarios across preference change,
   contradiction, long-gap recall, task continuity, privacy, abstention and hard
   retrieval.
+
+## Security model
+
+Trust is an invariant of the write path, not a per-endpoint convention:
+
+- **One policy for every writer.** `write`, `import` and `patch` all run the
+  same safety, sensitivity and provenance checks. Import is validated in full
+  before anything is written, and a memory id cannot change owner.
+- **Provenance must be signed, not declared.** Every `derived_from` id must
+  exist and belong to the same tenant/user. With attestation enabled, the
+  stored record and its parent chain are bound by an HMAC-SHA256 attestation;
+  changing content, type, source, parent or tenant breaks the signature, and a
+  forged or missing parent is rejected. `provenance_verified` is recomputed by
+  the server and cannot be set through metadata or a patch.
+- **Every store query is tenant-scoped.** `update`, `delete`, `export`,
+  `import`, `stats` and the audit log all require the service tenant; a request
+  with a different tenant is rejected with `403 tenant_isolation`.
+- **Audit is a hash chain.** Each event binds the previous event hash; editing,
+  deleting or reordering an event is detectable with `engram audit-verify`.
+- **Type and sensitivity only move up.** An untrusted or tainted record cannot
+  be promoted to semantic/procedural, and a patch cannot lower sensitivity.
+- **Context is structured, not string-concatenated.** Content is flattened to a
+  single line and the source lives in the line prefix; isolation filters
+  records by source before rendering, so a newline cannot forge a source.
+- **PII is redacted unless confirmed.** Sensitive content is stored redacted by
+  default; `confirmed: true` stores it verbatim. Secrets are rejected.
+- **Traces hold fingerprints, not payloads.**
+- **The API fails closed.** A key is required by default, CORS is opt-in, and
+  compose binds to loopback.
 
 ## MemPoison: the primary evidence
 
@@ -119,10 +159,13 @@ Current leaderboard (120 cases, deterministic victim simulator):
 | classifier | **5.0%** | 25.0% | **95.0%** | 25.0% |
 | isolation | 40.0% | 100.0% | 60.0% | 0.0% |
 | provenance | **10.0%** | **100.0%** | **90.0%** | 0.0% |
+| attestation | **0.0%** | **0.0%** | **100.0%** | 0.0% |
 
 Provenance is strongest on the base set but fails every adaptive case: forged
-provenance is still provenance. That is why integrity/signatures are the next
-defense, not another feature.
+provenance is still provenance. Signed attestation closes that gap: an agent
+write must carry a valid HMAC attestation, so the forged-parent adaptive cases
+are rejected. This assumes the attacker cannot sign as a trusted issuer; key
+compromise is out of scope (see [docs/ATTESTATION.md](docs/ATTESTATION.md)).
 
 The default victim is a deterministic simulator; `--victim llm` runs a real
 provider. The same command writes `heldout.jsonl` and
@@ -189,31 +232,40 @@ python -m engram.cli explain --user-id u1 --query "我的语言偏好"
 
 ### API server
 
+Authentication is required by default: the app refuses to start without
+`MEMORY_API_KEY`. Generate one, export it, then start the server.
+
 ```bash
-uvicorn engram.api:app --reload --host 127.0.0.1 --port 8000
+export MEMORY_API_KEY=$(python -c "import secrets; print(secrets.token_urlsafe(24))")
+uvicorn --factory engram.api:get_app --reload --host 127.0.0.1 --port 8000
 ```
 
 ```bash
 curl -X POST http://127.0.0.1:8000/v1/memories \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: $MEMORY_API_KEY" \
   -d '{"user_id":"u1","content":"我偏好中文解释，记住。"}'
 ```
 
-If `MEMORY_API_KEY` is set, add `-H "X-API-Key: <key>"`; `/health` stays public.
+`/health` stays public. For a loopback-only development run you can set
+`MEMORY_REQUIRE_AUTH=false`; never do that on a reachable interface.
 API reference: [docs/API.md](docs/API.md).
 
 ### Docker
 
 ```bash
 cp .env.example .env
+# put a generated key in .env (compose refuses to start without it)
+python -c "import secrets; print(secrets.token_urlsafe(24))"
 docker compose up --build
 curl http://127.0.0.1:8000/health
 ```
 
-If `MEMORY_API_KEY` is set in `.env`, add `-H "X-API-Key: <key>"` to `/v1/*`
-requests. The compose service has a healthcheck and runs as a non-root user.
-On Linux, ensure the bind-mounted `./data` directory is writable by the container
-user (UID 10001), or use a named volume.
+The compose port is bound to `127.0.0.1`, so the API is not exposed on the
+network by default. Add `-H "X-API-Key: <key>"` to `/v1/*` requests. The compose
+service has a healthcheck and runs as a non-root user. On Linux, ensure the
+bind-mounted `./data` directory is writable by the container user (UID 10001),
+or use a named volume.
 
 ### Python
 
@@ -233,6 +285,7 @@ print(result.context)
 Engram/
 ├── src/engram/
 │   ├── api.py               FastAPI app
+│   ├── audit.py             tamper-evident event hash chain
 │   ├── cli.py               command line interface
 │   ├── config.py            environment-driven config
 │   ├── debug.py             counterfactual memory influence
@@ -245,11 +298,12 @@ Engram/
 │   ├── judge.py             LLM judge + position/length bias probes
 │   ├── models.py            Pydantic models
 │   ├── poison/              MemPoison dataset + harness + leaderboard
+│   ├── provenance.py        signed provenance attestations + trust store
 │   ├── redteam.py           12-case safety suite
 │   ├── retrieval.py         hybrid retrieval + graph + MMR + budget
 │   ├── safety.py            injection/PII/secret/trust guard
 │   ├── service.py           high-level facade
-│   ├── storage.py           SQLite store + entity index
+│   ├── storage.py           SQLite store + tenant scope + entity index
 │   ├── trace.py             JSONL trace
 │   ├── viewer.py            HTML trace viewer
 │   ├── integrations/
@@ -259,7 +313,7 @@ Engram/
 │       ├── runner.py        memory vs full-history baseline + ablations
 │       ├── metrics.py       result structures + aggregates
 │       └── report.py        Markdown report
-├── tests/                   64 tests (pytest)
+├── tests/                   115 tests (pytest)
 ├── docs/                    architecture, API, evaluation, red-team, poisoning
 ├── examples/                quickstart + demo + research agent
 ├── reports/                 generated benchmark reports
@@ -307,25 +361,55 @@ Copy `.env.example` to `.env` and adjust:
 |---|---|---|
 | `MEMORY_DB_PATH` | `./data/memory.db` | SQLite file |
 | `MEMORY_TRACE_PATH` | `./data/trace.jsonl` | JSONL trace |
+| `MEMORY_TENANT_ID` | `default` | tenant boundary for every store query |
 | `EMBEDDING_PROVIDER` | `hash` | `hash` or `openai` |
 | `LLM_PROVIDER` | `heuristic` | `heuristic` or `openai` |
 | `OPENAI_API_KEY` | empty | required for `openai` providers |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | compatible endpoint |
 | `MEMORY_LLM_MAX_RETRIES` | `2` | retries for 429/5xx provider errors |
 | `MEMORY_LLM_RETRY_BACKOFF` | `0.5` | exponential backoff base (seconds) |
-| `MEMORY_API_KEY` | empty | if set, `/v1/*` requires `X-API-Key` |
+| `MEMORY_API_KEY` | empty | **required** unless `MEMORY_REQUIRE_AUTH=false`; sent as `X-API-Key` |
+| `MEMORY_REQUIRE_AUTH` | `true` | refuse to start without an API key |
+| `MEMORY_CORS_ORIGINS` | empty | comma-separated allowlist; no CORS headers when empty |
 | `MEMORY_TOKEN_BUDGET` | `800` | default retrieval budget |
+| `MEMORY_MAX_SCAN_CANDIDATES` | `20000` | hard scan cap; a truncated pass is reported |
+| `MEMORY_PREFILTER_CANDIDATES` | `300` | inverted-index candidate pool before exact scoring |
 | `MEMORY_RECENCY_HALF_LIFE_DAYS` | `30` | recency decay |
 | `MEMORY_DECAY_LAMBDA` | `0.01` | importance decay |
 | `MEMORY_DEDUPE_THRESHOLD` | `0.92` | duplicate similarity |
 | `MEMORY_GRAPH_ENABLED` | `true` | entity graph candidate expansion |
 | `MEMORY_GRAPH_WEIGHT` | `0.15` | graph score contribution |
 | `MEMORY_ALLOW_UNTRUSTED_SEMANTIC_WRITE` | `false` | trust policy |
-| `MEMORY_REQUIRE_CONFIRMATION_FOR_SENSITIVE` | `true` | sensitive writes |
+| `MEMORY_REQUIRE_CONFIRMATION_FOR_SENSITIVE` | `true` | PII handling |
+| `MEMORY_REDACT_SENSITIVE` | `true` | redact PII unless the write sets `confirmed=true` |
+| `MEMORY_RETRIEVAL_EXCLUDE_UNTRUSTED` | `false` | record-level isolation of untrusted sources |
 | `MEMORY_ENABLE_CONFLICTS` | `true` | conflict detection / supersede |
 | `MEMORY_SAFETY_ENABLED` | `true` | write-time safety guard |
 | `MEMORY_POISON_CLASSIFIER` | `false` | extra write-time poison classifier |
-| `MEMORY_PROVENANCE_ENABLED` | `false` | require trusted `derived_from` for agent memory |
+| `MEMORY_PROVENANCE_ENABLED` | `false` | require a resolvable trusted `derived_from` chain |
+| `MEMORY_ATTESTATION_ENABLED` | `false` | enable signed provenance (auto-on when a secret/trust store is set) |
+| `MEMORY_ATTESTATION_KEY_ID` | `local` | local signing key id |
+| `MEMORY_ATTESTATION_SECRET` | empty | HMAC secret used to sign accepted writes |
+| `MEMORY_ATTESTATION_ISSUER` | `engram-service` | issuer name in the attestation |
+| `MEMORY_ATTESTATION_KEYS` | empty | JSON trust store of external issuer keys |
+| `MEMORY_REQUIRE_ATTESTATION_FOR_AGENT` | `false` | reject unsigned agent writes |
+| `MEMORY_ATTESTATION_REQUIRE_SIGNED_PARENTS` | `true` | require a signed parent chain |
+
+## Attestation and audit
+
+```bash
+# Generate a local signing key (prints env vars and a trust-store entry)
+engram attest-keygen --key-id local --issuer engram-service
+
+# Verify one memory's provenance chain
+engram attest-verify --memory-id <id>
+
+# Verify the tenant's audit hash chain
+engram audit-verify
+```
+
+See [docs/ATTESTATION.md](docs/ATTESTATION.md) for the payload, threat model,
+key rotation and limits.
 
 ## Testing
 
@@ -336,8 +420,9 @@ mypy src/engram
 ```
 
 The test suite covers models, storage, extraction, retrieval, lifecycle,
-safety, service, API, LLM retries, graph memory, red-team, judge, viewer and the
-benchmark. Current run: **64 passed**.
+safety, signed provenance, tenant isolation, audit-chain tampering, service,
+API, LLM retries, graph memory, red-team, judge, viewer and the benchmark.
+Current run: **115 passed**.
 CI (`.github/workflows/ci.yml`) runs pytest, ruff and mypy on Python 3.10 and
 3.11, then builds the Docker image and smoke-tests the health endpoint.
 
@@ -384,8 +469,16 @@ More: [docs/DESIGN_DECISIONS.md](docs/DESIGN_DECISIONS.md).
 
 ## Limitations
 
-- SQLite and in-process vector scoring are for a single user / small corpus, not
-  multi-tenant production.
+- SQLite and in-process vector scoring are single-node, not a distributed
+  multi-tenant database. Tenant isolation is enforced in the application and
+  SQL predicates; use one SQLite file per tenant or Postgres row-level security
+  for hard isolation.
+- Signed provenance uses HMAC-SHA256, a shared-secret MAC. It proves that a
+  holder of the key signed the record, not public non-repudiation; use Ed25519
+  or a transparency log when third parties must verify without the secret.
+- The audit hash chain is tamper-evident, not tamper-proof: an attacker who can
+  rewrite the whole database can recompute it. Ship the head hash to an external
+  log or sign it for stronger guarantees.
 - The hash embedding is deterministic but semantically weak; switch to an
   embedding API for real retrieval quality.
 - The benchmark uses substring checks for reproducibility; add an LLM judge and

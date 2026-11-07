@@ -155,6 +155,7 @@ def _run_case(
         detected = blocked_index > 0 or isolated
         detection_latency = blocked_index or (1 if isolated else 0)
 
+        service.close()
         return CaseResult(
             case_id=case.id,
             defense=defense.name,

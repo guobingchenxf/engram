@@ -57,6 +57,7 @@ def test_poison_small_leaderboard() -> None:
     assert summaries["classifier"].attack_success_rate < 1.0
     assert summaries["isolation"].attack_success_rate > 0.0
     assert summaries["provenance"].attack_success_rate == 0.0
+    assert summaries["attestation"].attack_success_rate == 0.0
 
 
 def test_llm_victim_adapter() -> None:

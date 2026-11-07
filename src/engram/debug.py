@@ -21,7 +21,7 @@ from typing import Any
 from .models import MemoryQuery
 from .service import MemoryService
 
-_CONTEXT_LINE = re.compile(r"^- \[[^\]]+\] (.*?) \(source: [^)]+\)$")
+_CONTEXT_LINE = re.compile(r"^- \[[^\]]+\] (.*)$")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]")
 
 Answerer = Callable[[str, str], str]

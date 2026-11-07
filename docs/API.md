@@ -100,9 +100,21 @@ Response:
   "context": "Relevant long-term memories ...",
   "total_tokens": 28,
   "candidates": 3,
+  "truncated": false,
   "query": "我的语言偏好是什么"
 }
 ```
+
+Context lines are one per record and self-describing:
+
+```text
+- [semantic | 2026-11-06 | confidence=0.85 | source=user] 我偏好中文解释。
+```
+
+Content is flattened to a single line before rendering; the source is a
+structured prefix, not a suffix that content could imitate. `truncated` is true
+when the scan cap was reached, so a partial candidate set is visible instead of
+silent.
 
 `sensitive` and `secret` memories are excluded unless `include_sensitive` is
 true. Expired and superseded memories are excluded unless `include_expired` is
@@ -206,13 +218,14 @@ Returns an array of `ConflictRecord`:
 
 ### `GET /v1/trace?limit=100`
 
-Returns the last N JSONL trace records. This is the fastest way to see why a
-memory was written, merged, rejected or retrieved.
+Returns the last N JSONL trace records for the service tenant. This is the
+fastest way to see why a memory was written, merged, rejected or retrieved.
 
 ### `GET /v1/trace/view?limit=200`
 
 Returns a self-contained HTML trace viewer (filterable table + raw payloads).
-It is protected by `X-API-Key` when `MEMORY_API_KEY` is set.
+It is protected by the API key like every other `/v1/*` endpoint. Trace records
+contain content fingerprints and lengths, never memory payloads.
 
 ## Export / import
 
@@ -224,9 +237,76 @@ Returns an array of memory records (including expired/superseded ones).
 
 Body: an array of exported records. Returns `{"imported": N}`.
 
+Import is a write path, not a backdoor:
+
+- every record is validated in full before any record is written
+  (all-or-nothing);
+- an existing id cannot change owner (`import_cross_user_overwrite`);
+- safety, sensitivity and provenance checks run exactly as for `POST /v1/memories`;
+- every `derived_from` parent must exist for the same tenant/user, either in the
+  store or earlier in the same import batch;
+- a record carrying a valid attestation keeps it; an invalid/tampered
+  attestation is rejected;
+- sensitive content is redacted on import; secrets are rejected;
+- records from another tenant are rejected with `403 tenant_isolation`.
+
+## Tenant isolation
+
+Every request is scoped to the service tenant (`MEMORY_TENANT_ID`). A request
+body may include `tenant_id`; it must equal the service tenant or the request
+fails with `403 tenant_isolation`. The same applies to `update`, `delete`,
+`search`, `export` and `import`. There is no cross-tenant read or write path.
+
+## Signed provenance
+
+Writes can carry a signed attestation (or the service can sign them with
+`MEMORY_ATTESTATION_SECRET`). Verification is recursive over the parent chain.
+
+### `GET /v1/memories/{memory_id}/attestation`
+
+Returns the attestation verdict:
+
+```json
+{
+  "status": "verified",
+  "reasons": [],
+  "key_id": "local",
+  "issuer": "engram-service",
+  "depth": 1,
+  "root_ids": ["..."],
+  "attestation_hash": "..."
+}
+```
+
+Statuses include `verified`, `missing`, `invalid_signature`,
+`invalid_issued_at`, `unknown_key`, `key_not_allowed`, `parent_missing`,
+`parent_unverified`, `parent_changed`, `cycle`, `chain_too_deep` and
+`disabled`.
+
+## Audit chain
+
+Every event is appended to a per-tenant SHA-256 hash chain.
+
+### `GET /v1/audit/head`
+
+```json
+{"tenant_id": "default", "count": 42, "head_hash": "...", "last_event_id": 42, "last_event_at": "..."}
+```
+
+### `GET /v1/audit/verify`
+
+```json
+{"ok": true, "checked": 42, "tenant_id": "default", "head_hash": "...", "first_bad_id": null, "reason": null}
+```
+
+Deleting, editing or reordering an event yields `ok: false` with
+`first_bad_id` and a reason (`event_hash_mismatch`, `prev_hash_mismatch`).
+
 ## Authentication
 
-If `MEMORY_API_KEY` is set, every `/v1/*` endpoint requires the header:
+Authentication is required by default. Starting the app without
+`MEMORY_API_KEY` raises at startup; set `MEMORY_REQUIRE_AUTH=false` only for a
+loopback-only development run. Every `/v1/*` endpoint then requires:
 
 ```http
 X-API-Key: <MEMORY_API_KEY>
@@ -240,14 +320,16 @@ X-API-Key: <MEMORY_API_KEY>
 |---|---|---|
 | 400 | `safety_violation` | injection, secret, or untrusted durable write |
 | 401 | `unauthorized` | missing or invalid `X-API-Key` |
+| 403 | `tenant_isolation` | request crosses the service tenant boundary |
 | 404 | `not_found` | memory or conflict id does not exist |
 | 422 | validation error | malformed JSON or invalid enum/range |
 | 500 | internal error | unexpected server error |
 
 ## CORS
 
-The development app allows all origins. Before deploying, restrict
-`allow_origins` to your application domain.
+CORS is opt-in. With `MEMORY_CORS_ORIGINS` empty the app sends no CORS headers;
+set it to a comma-separated allowlist of application origins. There is no
+wildcard default.
 
 ## Versioning
 

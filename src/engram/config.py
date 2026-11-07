@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field, replace
 
+from .provenance import AttestationKey, parse_attestation_keys
+
 try:  # optional convenience: load a local .env if python-dotenv is installed
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover - optional dependency
@@ -38,6 +40,11 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _env_list(name: str) -> tuple[str, ...]:
+    raw = os.getenv(name, "")
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
 @dataclass(frozen=True)
 class RetrievalWeights:
     """Weights for the four retrieval signals. They are normalized on use."""
@@ -64,21 +71,33 @@ class MemoryConfig:
     db_path: str = "./data/memory.db"
     trace_path: str = "./data/trace.jsonl"
 
+    # Tenant boundary. Every store query is scoped by this value; a request
+    # that explicitly asks for another tenant is rejected.
+    tenant_id: str = "default"
+
     embedding_provider: str = "hash"  # hash | openai
     embedding_dim: int = 256
     embedding_model: str = "text-embedding-3-small"
 
     llm_provider: str = "heuristic"  # heuristic | openai
     llm_model: str = "gpt-4o-mini"
-    llm_api_key: str | None = None
+    llm_api_key: str | None = field(default=None, repr=False)
     llm_base_url: str = "https://api.openai.com/v1"
     request_timeout_seconds: float = 30.0
     llm_max_retries: int = 2
     llm_retry_backoff: float = 0.5
-    api_key: str | None = None
+    api_key: str | None = field(default=None, repr=False)
+    require_auth: bool = True
+    cors_origins: tuple[str, ...] = ()
 
     default_token_budget: int = 800
-    top_k_candidates: int = 64
+    # Hard cap on rows scanned per retrieval/conflict pass. The cap exists to
+    # bound cost, not to define the candidate set; a truncated pass is reported
+    # instead of silently returning a partial view.
+    max_scan_candidates: int = 20000
+    # Inverted-index candidate pool before exact scoring.  Larger improves
+    # recall; smaller bounds latency.
+    prefilter_candidates: int = 300
     recency_half_life_days: float = 30.0
     decay_lambda: float = 0.01
     dedupe_threshold: float = 0.92
@@ -90,18 +109,56 @@ class MemoryConfig:
 
     allow_untrusted_semantic_write: bool = False
     require_confirmation_for_sensitive: bool = True
+    redact_sensitive: bool = True
+    retrieval_exclude_untrusted: bool = False
     enable_conflicts: bool = True
     safety_enabled: bool = True
     poison_classifier_enabled: bool = False
     provenance_enabled: bool = False
 
+    # Signed provenance (HMAC-SHA256). The local key signs writes accepted by
+    # this service; trusted_attestation_keys is the verification trust store.
+    attestation_enabled: bool = False
+    attestation_key_id: str = "local"
+    attestation_secret: str | None = field(default=None, repr=False)
+    attestation_issuer: str = "engram-service"
+    trusted_attestation_keys: tuple[AttestationKey, ...] = ()
+    require_attestation_for_agent: bool = False
+    require_signed_parents: bool = True
+
     retrieval_weights: RetrievalWeights = field(default_factory=RetrievalWeights)
+
+    def __post_init__(self) -> None:
+        if self.embedding_dim <= 0:
+            raise ValueError("embedding_dim must be positive")
+        if self.max_scan_candidates < 1:
+            raise ValueError("max_scan_candidates must be positive")
+        if self.prefilter_candidates < 1:
+            raise ValueError("prefilter_candidates must be positive")
+        if not 0.0 <= self.mmr_lambda <= 1.0:
+            raise ValueError("mmr_lambda must be between 0 and 1")
+        if self.decay_lambda < 0:
+            raise ValueError("decay_lambda must be non-negative")
+
+    @property
+    def attestation_active(self) -> bool:
+        """True when signed provenance is explicitly enabled.
+
+        ``from_env`` enables this automatically when a secret or trust store is
+        present; a direct ``MemoryConfig`` must set ``attestation_enabled=True``.
+        """
+        return self.attestation_enabled
 
     @classmethod
     def from_env(cls) -> MemoryConfig:
+        attestation_keys = parse_attestation_keys(
+            os.getenv("MEMORY_ATTESTATION_KEYS")
+        )
+        attestation_secret = os.getenv("MEMORY_ATTESTATION_SECRET") or None
         return cls(
             db_path=_env_str("MEMORY_DB_PATH", "./data/memory.db"),
             trace_path=_env_str("MEMORY_TRACE_PATH", "./data/trace.jsonl"),
+            tenant_id=_env_str("MEMORY_TENANT_ID", "default"),
             embedding_provider=_env_str("EMBEDDING_PROVIDER", "hash").lower(),
             embedding_dim=_env_int("EMBEDDING_DIM", 256),
             embedding_model=_env_str("EMBEDDING_MODEL", "text-embedding-3-small"),
@@ -113,8 +170,11 @@ class MemoryConfig:
             llm_max_retries=_env_int("MEMORY_LLM_MAX_RETRIES", 2),
             llm_retry_backoff=_env_float("MEMORY_LLM_RETRY_BACKOFF", 0.5),
             api_key=os.getenv("MEMORY_API_KEY") or None,
+            require_auth=_env_bool("MEMORY_REQUIRE_AUTH", True),
+            cors_origins=_env_list("MEMORY_CORS_ORIGINS"),
             default_token_budget=_env_int("MEMORY_TOKEN_BUDGET", 800),
-            top_k_candidates=_env_int("MEMORY_TOP_K_CANDIDATES", 64),
+            max_scan_candidates=_env_int("MEMORY_MAX_SCAN_CANDIDATES", 20000),
+            prefilter_candidates=_env_int("MEMORY_PREFILTER_CANDIDATES", 300),
             recency_half_life_days=_env_float("MEMORY_RECENCY_HALF_LIFE_DAYS", 30.0),
             decay_lambda=_env_float("MEMORY_DECAY_LAMBDA", 0.01),
             dedupe_threshold=_env_float("MEMORY_DEDUPE_THRESHOLD", 0.92),
@@ -129,12 +189,32 @@ class MemoryConfig:
             require_confirmation_for_sensitive=_env_bool(
                 "MEMORY_REQUIRE_CONFIRMATION_FOR_SENSITIVE", True
             ),
+            redact_sensitive=_env_bool("MEMORY_REDACT_SENSITIVE", True),
+            retrieval_exclude_untrusted=_env_bool(
+                "MEMORY_RETRIEVAL_EXCLUDE_UNTRUSTED", False
+            ),
             enable_conflicts=_env_bool("MEMORY_ENABLE_CONFLICTS", True),
             safety_enabled=_env_bool("MEMORY_SAFETY_ENABLED", True),
             poison_classifier_enabled=_env_bool(
                 "MEMORY_POISON_CLASSIFIER", False
             ),
             provenance_enabled=_env_bool("MEMORY_PROVENANCE_ENABLED", False),
+            attestation_enabled=_env_bool(
+                "MEMORY_ATTESTATION_ENABLED",
+                bool(attestation_secret or attestation_keys),
+            ),
+            attestation_key_id=_env_str("MEMORY_ATTESTATION_KEY_ID", "local"),
+            attestation_secret=attestation_secret,
+            attestation_issuer=_env_str(
+                "MEMORY_ATTESTATION_ISSUER", "engram-service"
+            ),
+            trusted_attestation_keys=attestation_keys,
+            require_attestation_for_agent=_env_bool(
+                "MEMORY_REQUIRE_ATTESTATION_FOR_AGENT", False
+            ),
+            require_signed_parents=_env_bool(
+                "MEMORY_ATTESTATION_REQUIRE_SIGNED_PARENTS", True
+            ),
         )
 
     def with_overrides(self, **kwargs: object) -> MemoryConfig:

@@ -98,7 +98,30 @@
   fidelity@1/@2; `engram explain`.
 - [x] LLM victim adapter (`--victim llm`), held-out split + annotation template,
   and `mempoison-0.1` submission schema/validator.
-- [x] `ruff` clean, `mypy` clean, **64 tests passed**.
+- [x] `ruff` clean, `mypy` clean, **80 tests passed**.
+
+## Security hardening (2026-11-06)
+
+Eight reproduced defects were fixed; each has a regression test in
+`tests/test_security_regressions.py`.
+
+- [x] `/v1/import` runs the full write policy, is all-or-nothing, and cannot
+  change the owner of an existing id.
+- [x] `provenance` rejects any unresolvable `derived_from` id; verified status
+  is server-computed and cannot be written through metadata or a patch.
+- [x] `PATCH` cannot promote an untrusted/tainted record to durable memory,
+  edit protected metadata, or lower sensitivity.
+- [x] Context rendering flattens content and puts the source in a structured
+  prefix; isolation filters records by source, not by text lines.
+- [x] `keep_old` / `keep_both` restore the older record instead of leaving both
+  inactive.
+- [x] `explicit_change` runs after subject/attribute checks and needs real
+  overlap, so `现在` + weak similarity no longer supersedes unrelated memory.
+- [x] Retrieval, dedupe and conflict detection scan all candidate rows up to a
+  reported cap; the 64/250 windows are gone.
+- [x] PII is redacted unless `confirmed=true`; traces store fingerprints, not
+  payloads; the API requires a key by default; CORS is opt-in; compose binds to
+  loopback.
 
 ## Not done (requires external validation / real environment)
 
@@ -141,3 +164,40 @@ put benchmark numbers on a resume until the suite is green and the failures in
 - [x] MemPoison benchmark + leaderboard + technical report.
 - [x] Counterfactual memory explanation (`engram explain`).
 - [ ] A 1-page technical report explains architecture, baselines, ablations and limitations.
+
+## Production write path (2026-11-06)
+
+- [x] One guard for `write`, `patch` and `import`; no caller-supplied
+  `taint`/`provenance_verified`/attestation is trusted blindly.
+- [x] HMAC-SHA256 signed provenance over tenant/user/content/type/source/
+  sensitivity/parent hashes; recursive verification with cycle/depth limits.
+- [x] Attestation survives export/import only when valid; a tampered signature
+  is rejected; unknown/expired keys are not trusted.
+- [x] Tenant-scoped storage and API; cross-tenant reads, mutations and imports
+  are rejected with `403 tenant_isolation`.
+- [x] Per-tenant audit hash chain; payload tampering, deletion and prev-hash
+  editing are detected with the first bad event id.
+- [x] Legacy schema migration adds tenant/audit columns in place.
+- [x] Negative tests: forged/missing/cross-tenant parent, tampered content,
+  tampered attestation, invalid import, cross-tenant overwrite, audit tamper,
+  re-attestation and auth/CORS defaults.
+- [x] **115 tests**, ruff and mypy clean.
+
+## Engineering depth pass (2026-11-07)
+
+- [x] `StoreSession` unit-of-work: one connection / one `BEGIN IMMEDIATE` per
+  write, covering memory, entity/token indexes, conflict updates and audit.
+- [x] Per-thread connection cache; pragmas set once; explicit `close()` and
+  FastAPI lifespan shutdown.
+- [x] `content_hash` exact dedupe + `memory_tokens` inverted index for
+  retrieval/dedupe/conflict candidate prefiltering; no full-corpus scans.
+- [x] Vectorized cosine and vectorized MMR; cached tokenization/embeddings.
+- [x] SQL stats, batched forget, one-transaction maintenance with idempotent
+  decay (`last_decayed_at`).
+- [x] `PRAGMA user_version` schema migration; full backfills only on version
+  bump.
+- [x] Per-user write locks and `idempotency_key` for safe retries.
+- [x] `WriteGuard` extracted from `MemoryService`; storage split into
+  `SQLiteMemoryStore` + `StoreSession`.
+- [x] Measured at 1k memories: ~7ms/write (was ~241ms), ~50ms search
+  (was ~979ms), ~1.5ms stats.

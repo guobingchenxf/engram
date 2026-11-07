@@ -54,7 +54,9 @@ jobs:
 
       - name: Smoke test container
         run: |
-          docker run -d --name engram-ci -p 8000:8000 engram:ci
+          KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(24))')
+          docker run -d --name engram-ci -p 127.0.0.1:8000:8000 \
+            -e MEMORY_API_KEY="$KEY" engram:ci
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8000/health; then
               break

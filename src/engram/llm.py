@@ -53,6 +53,9 @@ class OpenAICompatibleLLM:
             timeout=timeout,
         )
 
+    def close(self) -> None:
+        self._client.close()
+
     def complete(
         self,
         messages: Sequence[dict[str, str]],

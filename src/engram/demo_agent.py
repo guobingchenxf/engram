@@ -90,6 +90,7 @@ def run_demo() -> None:
     for conflict in service.conflicts(user_id="demo-user"):
         print(conflict.model_dump(mode="json"))
     print("\nTrace written to ./data/demo_trace.jsonl")
+    service.close()
 
 
 if __name__ == "__main__":  # pragma: no cover

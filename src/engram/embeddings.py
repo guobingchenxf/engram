@@ -102,6 +102,9 @@ class OpenAIEmbedding:
             timeout=timeout,
         )
 
+    def close(self) -> None:
+        self._client.close()
+
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
         payload = {"model": self.model, "input": list(texts)}
         last_error: Exception | None = None

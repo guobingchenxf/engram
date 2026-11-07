@@ -13,9 +13,14 @@ def config(tmp_path) -> MemoryConfig:
         trace_path=str(tmp_path / "trace.jsonl"),
         embedding_provider="hash",
         llm_provider="heuristic",
+        require_auth=False,
     )
 
 
 @pytest.fixture()
-def service(config: MemoryConfig) -> MemoryService:
-    return MemoryService(config)
+def service(config: MemoryConfig):
+    instance = MemoryService(config)
+    try:
+        yield instance
+    finally:
+        instance.close()

@@ -63,7 +63,8 @@ artifact is different:
 
 ## Next milestones
 
-- Add integrity checks and consensus voting to MemPoison.
+- Add Ed25519/public verification, external audit-head anchoring and consensus
+  voting on top of the signed attestation path.
 - Run the LLM victim adapter (`--victim llm`) against a real provider.
 - Have two humans label the held-out split and report agreement.
 - Collect the first external submission in the published format.

@@ -19,4 +19,6 @@ USER appuser
 
 EXPOSE 8000
 
-CMD ["uvicorn", "engram.api:app", "--host", "0.0.0.0", "--port", "8000"]
+# The container listens on all interfaces; exposure is controlled by the
+# compose port binding (loopback) and the mandatory API key.
+CMD ["uvicorn", "--factory", "engram.api:get_app", "--host", "0.0.0.0", "--port", "8000"]

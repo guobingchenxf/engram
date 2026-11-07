@@ -8,8 +8,10 @@ from collections import Counter
 from collections.abc import Sequence
 from datetime import datetime
 
+import numpy as np
+
 from .config import MemoryConfig
-from .embeddings import EmbeddingProvider, cosine_similarity, estimate_tokens
+from .embeddings import EmbeddingProvider, estimate_tokens
 from .extraction import extract_entities
 from .models import (
     MemoryQuery,
@@ -21,12 +23,19 @@ from .models import (
     utcnow,
 )
 from .storage import SQLiteMemoryStore
+from .text import tokenize as _cached_tokenize
 
-_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f\u2028\u2029]+")
+
+
+def _one_line(text: str) -> str:
+    """Keep a memory on a single context line so it cannot forge structure."""
+    return _CONTROL_RE.sub(" ", text).strip()
 
 
 def tokenize(text: str) -> list[str]:
-    return _TOKEN_RE.findall(text.lower())
+    # text.tokenize is LRU-cached; return a list for the BM25/coverage code.
+    return list(_cached_tokenize(text))
 
 
 class BM25Index:
@@ -90,12 +99,47 @@ class RetrievalService:
         self.weights = config.retrieval_weights.normalized()
 
     def search(self, query: MemoryQuery) -> MemorySearchResult:
-        candidates = self.store.search_candidates(
+        scan_limit = max(1, self.config.max_scan_candidates)
+        tenant_id = query.tenant_id or self.config.tenant_id
+        query_tokens = tokenize(query.query)
+
+        # Lexical prefilter: the inverted index gives O(K) candidates instead
+        # of loading the whole user corpus.  Recent candidates keep semantic
+        # recall for embedding queries with little lexical overlap.
+        merged: dict[str, MemoryRecord] = {}
+        lexical = (
+            self.store.find_by_tokens(
+                query.user_id,
+                query_tokens,
+                tenant_id=tenant_id,
+                limit=max(100, self.config.prefilter_candidates),
+            )
+            if query_tokens
+            else []
+        )
+        recent = self.store.search_candidates(
             query.user_id,
+            tenant_id=tenant_id,
             types=query.types,
             include_expired=query.include_expired,
-            limit=max(self.config.top_k_candidates, query.top_k * 8),
+            limit=min(scan_limit, 200),
         )
+        for record in [*lexical, *recent]:
+            if record.type is not None and query.types and record.type not in query.types:
+                continue
+            merged.setdefault(record.id, record)
+        truncated = False
+        if not merged:
+            scanned = self.store.search_candidates(
+                query.user_id,
+                tenant_id=tenant_id,
+                types=query.types,
+                include_expired=query.include_expired,
+                limit=scan_limit + 1,
+            )
+            truncated = len(scanned) > scan_limit
+            for record in scanned[:scan_limit]:
+                merged.setdefault(record.id, record)
 
         query_entities = (
             extract_entities(query.query) if self.config.graph_enabled else []
@@ -103,13 +147,13 @@ class RetrievalService:
         if query_entities:
             graph_candidates = self.store.find_by_entities(
                 query.user_id,
-                query_entities,
-                limit=self.config.top_k_candidates,
+                tenant_id=tenant_id,
+                entities=query_entities,
+                limit=scan_limit,
             )
-            merged = {record.id: record for record in candidates}
             for record in graph_candidates:
                 merged.setdefault(record.id, record)
-            candidates = list(merged.values())
+        candidates = list(merged.values())
 
         candidates = [record for record in candidates if self._passes_filters(record, query)]
 
@@ -119,25 +163,48 @@ class RetrievalService:
                 context="",
                 total_tokens=0,
                 candidates=0,
+                truncated=truncated,
                 query=query.query,
             )
 
         query_embedding = self.embedder.embed([query.query])[0]
-        query_tokens = tokenize(query.query)
         query_term_set = set(query_tokens)
         query_entity_set = {entity.lower() for entity in query_entities}
-        documents = [tokenize(record.content + " " + " ".join(record.entities)) for record in candidates]
+        documents = [
+            tokenize(record.content + " " + " ".join(record.entities))
+            for record in candidates
+        ]
         bm25 = BM25Index(documents)
         keyword_scores = bm25.scores(query_tokens)
         max_keyword = max(keyword_scores) if keyword_scores else 0.0
 
-        scored: list[tuple[float, float, float, MemoryRecord]] = []
-        for record, keyword_score, document in zip(candidates, keyword_scores, documents):
-            embedding_relevance = (
-                cosine_similarity(query_embedding, record.embedding)
-                if record.embedding
-                else 0.0
+        # Vectorized cosine over the candidate matrix.  This avoids one
+        # np.asarray/norm round-trip per record, which dominated search at
+        # ~1k candidates.
+        embedding_scores = [0.0] * len(candidates)
+        query_vector = np.asarray(query_embedding, dtype=np.float32)
+        query_norm = float(np.linalg.norm(query_vector))
+        dim = len(query_embedding)
+        indices = [
+            index
+            for index, record in enumerate(candidates)
+            if record.embedding is not None and len(record.embedding) == dim
+        ]
+        if indices and query_norm > 0:
+            matrix = np.asarray(
+                [candidates[index].embedding for index in indices],
+                dtype=np.float32,
             )
+            norms = np.linalg.norm(matrix, axis=1)
+            norms[norms == 0] = 1.0
+            similarities = (matrix @ query_vector) / (norms * query_norm)
+            for index, similarity in zip(indices, similarities):
+                embedding_scores[index] = float(similarity)
+
+        scored: list[tuple[float, float, float, MemoryRecord]] = []
+        for record, keyword_score, document, embedding_relevance in zip(
+            candidates, keyword_scores, documents, embedding_scores
+        ):
             coverage = (
                 len(query_term_set & set(document)) / len(query_term_set)
                 if query_term_set
@@ -194,10 +261,10 @@ class RetrievalService:
                 )
             )
             date = (record.last_accessed or record.created_at).date().isoformat()
-            source = record.source or record.source_type.value
+            source = record.source_type.value
             context_lines.append(
-                f"- [{record.type.value} | {date} | confidence={record.confidence:.2f}] "
-                f"{content} (source: {source})"
+                f"- [{record.type.value} | {date} | confidence={record.confidence:.2f} "
+                f"| source={source}] {_one_line(content)}"
             )
 
         if context_lines:
@@ -208,18 +275,23 @@ class RetrievalService:
         else:
             context = ""
 
-        for hit in hits:
-            self.store.touch(hit.memory.id)
+        if hits:
+            self.store.touch_many(
+                [hit.memory.id for hit in hits], tenant_id=tenant_id
+            )
 
         return MemorySearchResult(
             hits=hits,
             context=context,
             total_tokens=total_tokens,
             candidates=len(candidates),
+            truncated=truncated,
             query=query.query,
         )
 
     def _passes_filters(self, record: MemoryRecord, query: MemoryQuery) -> bool:
+        if self.config.retrieval_exclude_untrusted and not record.source_type.is_trusted:
+            return False
         if query.include_ids and record.id not in query.include_ids:
             return False
         if record.id in query.exclude_ids:
@@ -265,34 +337,45 @@ class RetrievalService:
         *,
         top_k: int,
     ) -> list[tuple[float, float, float, MemoryRecord]]:
-        """Maximal Marginal Relevance for a little diversity."""
-        remaining = list(scored)
-        selected: list[tuple[float, float, float, MemoryRecord]] = []
+        """Maximal Marginal Relevance, vectorized over the candidate matrix."""
+        if not scored:
+            return []
         lam = max(0.0, min(1.0, self.config.mmr_lambda))
+        records = [item[3] for item in scored]
+        dimension = next(
+            (len(record.embedding) for record in records if record.embedding),
+            0,
+        )
+        matrix = np.zeros((len(records), max(1, dimension)), dtype=np.float32)
+        if dimension:
+            for index, record in enumerate(records):
+                if record.embedding and len(record.embedding) == dimension:
+                    matrix[index] = np.asarray(record.embedding, dtype=np.float32)
+            norms = np.linalg.norm(matrix, axis=1)
+            norms[norms == 0] = 1.0
+            matrix /= norms[:, None]
+        else:
+            matrix = np.zeros((len(records), 1), dtype=np.float32)
+
+        scores = np.asarray([item[0] for item in scored], dtype=np.float32)
+        remaining = list(range(len(scored)))
+        selected_indices: list[int] = []
+        selected: list[tuple[float, float, float, MemoryRecord]] = []
 
         while remaining and len(selected) < top_k:
-            best_item: tuple[float, float, float, MemoryRecord] | None = None
-            best_value = float("-inf")
-
-            for item in remaining:
-                record = item[3]
-                max_similarity = 0.0
-                if selected and record.embedding:
-                    similarities = [
-                        cosine_similarity(record.embedding, other[3].embedding)
-                        for other in selected
-                        if other[3].embedding
-                    ]
-                    max_similarity = max(similarities) if similarities else 0.0
-                value = lam * item[0] - (1 - lam) * max_similarity
-                if value > best_value:
-                    best_value = value
-                    best_item = item
-
-            if best_item is None:
-                break
-            selected.append(best_item)
-            remaining.remove(best_item)
+            remaining_arr = np.asarray(remaining, dtype=np.int64)
+            if selected_indices:
+                selected_matrix = matrix[selected_indices]
+                max_similarity = np.max(
+                    matrix[remaining_arr] @ selected_matrix.T, axis=1
+                )
+            else:
+                max_similarity = np.zeros(len(remaining), dtype=np.float32)
+            values = lam * scores[remaining_arr] - (1 - lam) * max_similarity
+            best_position = int(np.argmax(values))
+            best_index = remaining.pop(best_position)
+            selected_indices.append(best_index)
+            selected.append(scored[best_index])
         return selected
 
 

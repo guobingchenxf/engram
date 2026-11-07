@@ -91,10 +91,13 @@ def _run_condition(
             **(overrides or {}),
         )
         service = MemoryService(config_for_scenario)
-        _ingest_scenario(service, scenario)
-        return _evaluate_with_memory(
-            service, scenario, include_sensitive=include_sensitive
-        )
+        try:
+            _ingest_scenario(service, scenario)
+            return _evaluate_with_memory(
+                service, scenario, include_sensitive=include_sensitive
+            )
+        finally:
+            service.close()
 
 
 def _ingest_scenario(service: MemoryService, scenario: Scenario) -> None:

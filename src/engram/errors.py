@@ -15,6 +15,14 @@ class SafetyViolation(EngramError):
     """A write was rejected by the safety guard."""
 
 
+class AttestationViolation(SafetyViolation):
+    """A write's provenance attestation is missing, invalid or untrusted."""
+
+
+class TenantIsolationError(EngramError):
+    """A request tried to cross a tenant boundary."""
+
+
 class ConflictError(EngramError):
     """A conflict operation could not be completed."""
 

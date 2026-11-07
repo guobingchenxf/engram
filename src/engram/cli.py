@@ -133,6 +133,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     submit.add_argument("path")
 
+    keygen = subparsers.add_parser(
+        "attest-keygen", help="generate a local attestation key and env JSON"
+    )
+    keygen.add_argument("--key-id", default="local")
+    keygen.add_argument("--issuer", default="engram-service")
+    keygen.add_argument("--secret", default=None)
+
+    attest_verify = subparsers.add_parser(
+        "attest-verify", help="verify a memory's signed provenance chain"
+    )
+    attest_verify.add_argument("--memory-id", required=True)
+
+    subparsers.add_parser(
+        "audit-verify", help="verify the tamper-evident audit hash chain"
+    )
+
     return parser
 
 
@@ -215,6 +231,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         _print(submission.model_dump())
         return 0
 
+    if args.command == "attest-keygen":
+        import secrets
+
+        secret = args.secret or secrets.token_urlsafe(32)
+        _print(
+            {
+                "key_id": args.key_id,
+                "issuer": args.issuer,
+                "secret": secret,
+                "env": {
+                    "MEMORY_ATTESTATION_ENABLED": "true",
+                    "MEMORY_ATTESTATION_KEY_ID": args.key_id,
+                    "MEMORY_ATTESTATION_SECRET": secret,
+                    "MEMORY_ATTESTATION_ISSUER": args.issuer,
+                },
+                "trust_store_entry": {
+                    "key_id": args.key_id,
+                    "secret": secret,
+                    "issuer": args.issuer,
+                },
+            }
+        )
+        return 0
+
     service = _service(args)
 
     if args.command == "init":
@@ -238,7 +278,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         output = Path(args.out)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(
-            render_trace_html(service.trace.read(limit=args.limit)),
+            render_trace_html(
+                service.trace.read(
+                    limit=args.limit, tenant_id=service.tenant_id
+                )
+            ),
             encoding="utf-8",
         )
         _print({"path": str(output), "limit": args.limit})
@@ -254,6 +298,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "results": [asdict(result) for result in results],
             }
         )
+    elif args.command == "attest-verify":
+        verdict = service.verify_record_attestation(args.memory_id)
+        if verdict is None:
+            _print({"error": "memory not found"})
+            return 1
+        _print(verdict)
+    elif args.command == "audit-verify":
+        _print(service.verify_audit())
     elif args.command == "write":
         record = service.write(
             MemoryWriteRequest(

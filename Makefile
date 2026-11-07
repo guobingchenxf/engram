@@ -11,7 +11,7 @@ lint:
 	mypy src/engram
 
 run:
-	uvicorn engram.api:app --reload --host 127.0.0.1 --port 8000
+	uvicorn --factory engram.api:get_app --reload --host 127.0.0.1 --port 8000
 
 demo:
 	python -m engram.demo_agent

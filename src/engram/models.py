@@ -69,6 +69,7 @@ class MemoryRecord(BaseModel):
 
     id: str = Field(default_factory=lambda: uuid4().hex)
     user_id: str = Field(min_length=1)
+    tenant_id: str = "default"
     type: MemoryType = MemoryType.SEMANTIC
     content: str = Field(min_length=1)
     summary: str | None = None
@@ -125,6 +126,9 @@ class MemoryWriteRequest(BaseModel):
     """Input for an explicit memory write."""
 
     user_id: str = Field(min_length=1)
+    tenant_id: str | None = None
+    id: str | None = None
+    created_at: datetime | None = None
     content: str = Field(min_length=1)
     type: MemoryType = MemoryType.SEMANTIC
     source_type: SourceType = SourceType.USER
@@ -135,12 +139,18 @@ class MemoryWriteRequest(BaseModel):
     importance: float | None = Field(default=None, ge=0.0, le=1.0)
     ttl_seconds: int | None = Field(default=None, ge=0)
     sensitivity: Sensitivity | None = None
+    confirmed: bool = False
+    idempotency_key: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # Pre-signed attestation supplied by an external issuer (e.g. an agent
+    # runtime). The service verifies it; it never trusts it blindly.
+    attestation: dict[str, Any] | None = None
 
 
 class MemoryUpdateRequest(BaseModel):
     """Partial update; only explicitly set fields are applied."""
 
+    tenant_id: str | None = None
     content: str | None = None
     summary: str | None = None
     type: MemoryType | None = None
@@ -150,6 +160,7 @@ class MemoryUpdateRequest(BaseModel):
     sensitivity: Sensitivity | None = None
     valid_to: datetime | None = None
     ttl_seconds: int | None = Field(default=None, ge=0)
+    confirmed: bool = False
     metadata: dict[str, Any] | None = None
 
 
@@ -157,6 +168,7 @@ class ExplainRequest(BaseModel):
     """Input for counterfactual memory explanation."""
 
     user_id: str = Field(min_length=1)
+    tenant_id: str | None = None
     query: str = Field(min_length=1)
     top_k: int = Field(default=5, ge=1, le=50)
     token_budget: int = Field(default=500, ge=32, le=32000)
@@ -168,6 +180,7 @@ class ExtractRequest(BaseModel):
     """Input for extraction from a block of text."""
 
     user_id: str = Field(min_length=1)
+    tenant_id: str | None = None
     text: str = Field(min_length=1)
     source_type: SourceType = SourceType.USER
     source: str | None = None
@@ -192,6 +205,7 @@ class MemoryQuery(BaseModel):
     """A retrieval request."""
 
     user_id: str = Field(min_length=1)
+    tenant_id: str | None = None
     query: str = Field(min_length=1)
     types: list[MemoryType] | None = None
     top_k: int = Field(default=8, ge=1, le=100)
@@ -226,6 +240,7 @@ class MemorySearchResult(BaseModel):
     context: str = ""
     total_tokens: int = 0
     candidates: int = 0
+    truncated: bool = False
     query: str = ""
 
 
@@ -234,6 +249,7 @@ class ConflictRecord(BaseModel):
 
     id: str = Field(default_factory=lambda: uuid4().hex)
     user_id: str
+    tenant_id: str = "default"
     existing_id: str
     new_id: str
     reason: str
@@ -255,6 +271,7 @@ class SafetyAssessment(BaseModel):
 
 class MemoryStats(BaseModel):
     user_id: str | None = None
+    tenant_id: str | None = None
     total: int = 0
     active: int = 0
     expired: int = 0

@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import re
 from datetime import datetime
+from typing import Any
 
 from .config import MemoryConfig
 from .embeddings import EmbeddingProvider, cosine_similarity
@@ -15,6 +16,7 @@ from .models import (
     utcnow,
 )
 from .storage import SQLiteMemoryStore
+from .text import tokenize
 
 _CHANGE_MARKERS = re.compile(
     r"(现在|如今|改成|改为|改用|换成|更新|提升到|升到|降到|不再|换了|改主意|"
@@ -43,48 +45,46 @@ class ConflictDetector:
         if existing.content.strip().lower() == new.content.strip().lower():
             return None  # exact duplicate, not a conflict
 
-        similarity = self._similarity(existing, new)
         existing_entities = set(existing.entities)
         new_entities = set(new.entities)
         shared_entities = existing_entities & new_entities
 
-        if _CHANGE_MARKERS.search(new.content) and (similarity >= 0.20 or shared_entities):
+        # "My language preference is Chinese" and "I prefer Sichuan food" are
+        # different attributes, not a contradiction.  Attribute/entity overlap
+        # is the evidence that two statements talk about the same fact; raw
+        # lexical similarity is not enough.
+        same_attribute = _comparable_attributes(existing.content, new.content)
+        subject_known = bool(shared_entities) or same_attribute
+
+        # A change marker only means "this is a correction" when we know both
+        # statements are about the same subject.  "现在" alone must not
+        # supersede an unrelated memory.
+        if _CHANGE_MARKERS.search(new.content) and subject_known:
             return "explicit_change"
 
         # "Project Alpha is due Nov 15" and "Project Beta is due Dec 1" are
-        # different subjects, not a contradiction. Only treat two facts as
-        # comparable when they share a subject/entity.
+        # different subjects, not a contradiction.  This guard applies to
+        # ordinary contradictions; an explicit change about the same attribute
+        # (e.g. MMoE -> DIN) is handled above.
         if existing_entities and new_entities and not shared_entities:
             return None
 
-        # "My language preference is Chinese" and "I prefer Sichuan food" are
-        # different attributes, not a contradiction.
-        if not _comparable_attributes(existing.content, new.content):
+        if not subject_known:
             return None
 
         existing_negative = bool(_NEGATIONS.search(existing.content))
         new_negative = bool(_NEGATIONS.search(new.content))
-        if existing_negative != new_negative and (similarity >= 0.40 or shared_entities):
+        if existing_negative != new_negative:
             return "negation_mismatch"
 
         existing_numbers = _numbers(existing.content)
         new_numbers = _numbers(new.content)
-        if (
-            existing_numbers
-            and new_numbers
-            and existing_numbers != new_numbers
-            and (similarity >= 0.25 or shared_entities)
-        ):
+        if existing_numbers and new_numbers and existing_numbers != new_numbers:
             return "numeric_conflict"
 
         existing_value = _extract_value(existing.content)
         new_value = _extract_value(new.content)
-        if (
-            existing_value
-            and new_value
-            and existing_value != new_value
-            and (similarity >= 0.30 or shared_entities)
-        ):
+        if existing_value and new_value and existing_value != new_value:
             return "value_conflict"
 
         return None
@@ -106,17 +106,47 @@ class LifecycleManager:
         self.config = config
         self.detector = ConflictDetector(embedder, config)
 
-    def on_write(self, new_record: MemoryRecord) -> list[ConflictRecord]:
+    def on_write(
+        self, new_record: MemoryRecord, *, store: Any = None
+    ) -> list[ConflictRecord]:
         """Detect conflicts for a newly inserted record and supersede when safe."""
-        candidates = self.store.search_candidates(
-            new_record.user_id,
-            types=[new_record.type],
-            include_expired=False,
-            limit=250,
+        target = store or self.store
+        tokens = tokenize(
+            new_record.content + " " + " ".join(map(str, new_record.entities))
         )
-        conflicts: list[ConflictRecord] = []
+        merged: dict[str, MemoryRecord] = {}
+        if tokens:
+            for record in target.find_by_tokens(
+                new_record.user_id,
+                tokens,
+                tenant_id=new_record.tenant_id,
+                limit=64,
+                shared_only=True,
+            ):
+                merged[record.id] = record
+        if new_record.entities:
+            for record in target.find_by_entities(
+                new_record.user_id,
+                new_record.entities,
+                tenant_id=new_record.tenant_id,
+                limit=100,
+            ):
+                merged.setdefault(record.id, record)
+        merged.pop(new_record.id, None)
+        if not merged:
+            for record in target.search_candidates(
+                new_record.user_id,
+                tenant_id=new_record.tenant_id,
+                types=[new_record.type],
+                include_expired=False,
+                limit=64,
+            ):
+                merged[record.id] = record
 
-        for existing in candidates:
+        conflicts: list[ConflictRecord] = []
+        for existing in merged.values():
+            if existing.id == new_record.id or existing.type != new_record.type:
+                continue
             reason = self.detector.detect(existing, new_record)
             if reason is None:
                 continue
@@ -131,61 +161,111 @@ class LifecycleManager:
             if should_supersede:
                 existing.valid_to = utcnow()
                 existing.superseded_by = new_record.id
-                self.store.update(existing)
+                target.update(existing, sync_indexes=False)
                 if existing.id not in new_record.supersedes:
                     new_record.supersedes.append(existing.id)
 
             conflict = ConflictRecord(
                 user_id=new_record.user_id,
+                tenant_id=new_record.tenant_id,
                 existing_id=existing.id,
                 new_id=new_record.id,
                 reason=reason,
             )
-            self.store.add_conflict(conflict)
+            target.add_conflict(conflict)
             conflicts.append(conflict)
 
         if new_record.supersedes:
-            self.store.update(new_record)
+            target.update(new_record, sync_indexes=False)
         return conflicts
 
-    def expire(self, now: datetime | None = None) -> int:
+    def expire(
+        self, now: datetime | None = None, *, tenant_id: str = "default"
+    ) -> int:
+        with self.store.transaction() as session:
+            return self._expire(session, now, tenant_id=tenant_id)
+
+    def _expire(
+        self,
+        session: Any,
+        now: datetime | None,
+        *,
+        tenant_id: str,
+    ) -> int:
         current = ensure_utc(now) or utcnow()
         count = 0
-        for record in self._all_records():
+        for record in self._all_records(tenant_id, store=session):
             if record.valid_to is None and record.is_expired(current):
                 record.valid_to = current
-                self.store.update(record)
+                session.update(record, sync_indexes=False)
                 count += 1
         return count
 
-    def decay(self, now: datetime | None = None) -> int:
+    def decay(
+        self, now: datetime | None = None, *, tenant_id: str = "default"
+    ) -> int:
+        with self.store.transaction() as session:
+            return self._decay(session, now, tenant_id=tenant_id)
+
+    def _decay(
+        self,
+        session: Any,
+        now: datetime | None,
+        *,
+        tenant_id: str,
+    ) -> int:
         current = ensure_utc(now) or utcnow()
         count = 0
-        for record in self._all_records():
+        for record in self._all_records(tenant_id, store=session):
             if not record.is_active(current):
                 continue
-            reference = ensure_utc(record.last_accessed) or ensure_utc(record.created_at) or current
+            reference = (
+                ensure_utc(record.metadata.get("last_decayed_at"))
+                or ensure_utc(record.last_accessed)
+                or ensure_utc(record.created_at)
+                or current
+            )
             age_days = max(0.0, (current - reference).total_seconds() / 86400.0)
-            decayed = record.importance * math.exp(-self.config.decay_lambda * age_days)
-            if decayed < self.config.prune_importance_threshold:
+            decayed = record.importance * math.exp(
+                -self.config.decay_lambda * age_days
+            )
+            pruned = decayed < self.config.prune_importance_threshold
+            changed = abs(decayed - record.importance) > 1e-6
+            if not changed and not pruned:
+                continue
+            record.metadata["last_decayed_at"] = current.isoformat()
+            if pruned:
                 record.valid_to = current
                 record.metadata["pruned"] = True
                 count += 1
-            if abs(decayed - record.importance) > 1e-6:
-                record.importance = max(0.0, min(1.0, decayed))
-                self.store.update(record)
+            record.importance = max(0.0, min(1.0, decayed))
+            session.update(record, sync_indexes=False)
         return count
 
-    def prune(self, now: datetime | None = None) -> int:
+    def prune(
+        self, now: datetime | None = None, *, tenant_id: str = "default"
+    ) -> int:
+        with self.store.transaction() as session:
+            return self._prune(session, now, tenant_id=tenant_id)
+
+    def _prune(
+        self,
+        session: Any,
+        now: datetime | None,
+        *,
+        tenant_id: str,
+    ) -> int:
         current = ensure_utc(now) or utcnow()
         removed = 0
-        for record in self._all_records():
+        for record in self._all_records(tenant_id, store=session):
             expired = record.valid_to is not None and record.valid_to <= current
             prunable = (
                 record.metadata.get("pruned")
                 or record.importance < self.config.prune_importance_threshold
             )
-            if expired and prunable and self.store.delete(record.id):
+            if expired and prunable and session.delete(
+                record.id, tenant_id=tenant_id
+            ):
                 removed += 1
         return removed
 
@@ -193,23 +273,31 @@ class LifecycleManager:
         self,
         now: datetime | None = None,
         *,
+        tenant_id: str = "default",
         prune: bool = False,
     ) -> dict[str, int]:
-        expired = self.expire(now)
-        decayed = self.decay(now)
-        removed = self.prune(now) if prune else 0
+        with self.store.transaction() as session:
+            expired = self._expire(session, now, tenant_id=tenant_id)
+            decayed = self._decay(session, now, tenant_id=tenant_id)
+            removed = (
+                self._prune(session, now, tenant_id=tenant_id) if prune else 0
+            )
         return {"expired": expired, "decayed": decayed, "pruned": removed}
 
-    def resolve_conflict(self, conflict_id: str, strategy: str) -> ConflictRecord | None:
-        conflict = self.store.get_conflict(conflict_id)
+    def resolve_conflict(
+        self, conflict_id: str, strategy: str, *, tenant_id: str = "default"
+    ) -> ConflictRecord | None:
+        conflict = self.store.get_conflict(conflict_id, tenant_id=tenant_id)
         if conflict is None:
             return None
 
-        existing = self.store.get(conflict.existing_id)
-        new = self.store.get(conflict.new_id)
+        existing = self.store.get(conflict.existing_id, tenant_id=tenant_id)
+        new = self.store.get(conflict.new_id, tenant_id=tenant_id)
         now = utcnow()
 
         if strategy == "keep_new" and existing and new:
+            if new.superseded_by == existing.id:
+                _undo_supersede(new, existing.id)
             existing.valid_to = now
             existing.superseded_by = new.id
             if existing.id not in new.supersedes:
@@ -217,16 +305,39 @@ class LifecycleManager:
             self.store.update(existing)
             self.store.update(new)
         elif strategy == "keep_old" and existing and new:
+            _undo_supersede(existing, new.id)
             new.valid_to = now
             new.superseded_by = existing.id
+            new.supersedes = [item for item in new.supersedes if item != existing.id]
+            self.store.update(existing)
+            self.store.update(new)
+        elif strategy == "keep_both" and existing and new:
+            _undo_supersede(existing, new.id)
+            new.supersedes = [item for item in new.supersedes if item != existing.id]
+            self.store.update(existing)
             self.store.update(new)
         elif strategy != "keep_both":
             raise ValueError(f"unknown strategy: {strategy}")
 
-        return self.store.resolve_conflict(conflict_id, strategy)
+        return self.store.resolve_conflict(
+            conflict_id, strategy, tenant_id=tenant_id
+        )
 
-    def _all_records(self) -> list[MemoryRecord]:
-        return [MemoryRecord.model_validate(item) for item in self.store.export()]
+    def _all_records(
+        self, tenant_id: str, *, store: Any = None
+    ) -> list[MemoryRecord]:
+        target = store or self.store
+        return [
+            MemoryRecord.model_validate(item)
+            for item in target.export(tenant_id=tenant_id)
+        ]
+
+
+def _undo_supersede(record: MemoryRecord, by_id: str) -> None:
+    """Revive a record only when this conflict caused its supersession."""
+    if record.superseded_by == by_id:
+        record.superseded_by = None
+        record.valid_to = None
 
 
 def _jaccard(left: str, right: str) -> float:
@@ -262,6 +373,15 @@ _ATTRIBUTE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("延迟", re.compile(r"延迟|latency", re.IGNORECASE)),
     ("模型", re.compile(r"模型")),
     ("偏好域", re.compile(r"中文|英文|日文|解释")),
+    ("地点", re.compile(r"城市|地点|住址|实习|杭州|上海|北京|深圳")),
+    (
+        "工具",
+        re.compile(
+            r"\bPython\b|\bGo\b|\bJava\b|\bRust\b|\bC\+\+\b|FastAPI|VS Code|"
+            r"编辑器|工具|做实验|做服务",
+            re.IGNORECASE,
+        ),
+    ),
 )
 
 

@@ -21,23 +21,37 @@ demo agent exists only to exercise the memory API.
 └──────────────────────────────┬───────────────────────────────┘
                                ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ MemoryService                                                │
+│ MemoryService (orchestration)                                │
 │  write / extract_and_write / search / update / forget        │
 │  maintenance / conflicts / export / import                   │
 └───────┬───────────────┬───────────────┬───────────────┬──────┘
         ▼               ▼               ▼               ▼
 ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-│ SafetyGuard  │ │ Extractor    │ │ Retrieval    │ │ Lifecycle    │
-│ trust/PII    │ │ LLM/heuristic│ │ BM25+vector  │ │ conflict/    │
-│ injection    │ │              │ │ +recency     │ │ decay/TTL    │
+│ WriteGuard   │ │ Extractor    │ │ Retrieval    │ │ Lifecycle    │
+│ safety/PII   │ │ LLM/heuristic│ │ BM25+vector  │ │ conflict/    │
+│ provenance   │ │              │ │ +recency     │ │ decay/TTL    │
+│ attestation  │ │              │ │ +MMR         │ │              │
 └───────┬──────┘ └───────┬──────┘ └───────┬──────┘ └───────┬──────┘
         └────────────────┴───────────────┴───────────────┘
                                ▼
+              ┌──────────────────────────────────┐
+              │ ProvenanceAttestor (HMAC chain)  │
+              │ Audit hash chain (per tenant)    │
+              └──────────────────────────────────┘
+                               ▼
 ┌──────────────────────────────────────────────────────────────┐
+│ StoreSession: one connection, one transaction per write      │
 │ SQLiteMemoryStore: memories / conflicts / events             │
-│ TraceLogger: JSONL append-only trace                         │
+│   tenant_id + content_hash + memory_tokens (inverted index)  │
+│   per-thread connection cache; WAL; hash-chained events      │
+│ TraceLogger: buffered JSONL append-only trace                │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+Hot path: retrieval uses `memory_tokens` as an inverted index to get a
+candidate pool, scores it with a vectorized numpy cosine, and selects with a
+vectorized MMR. Writes use one `BEGIN IMMEDIATE` transaction covering memory,
+entity/token indexes, conflict updates and the audit event.
 
 ## 3. Data model
 
@@ -88,7 +102,10 @@ text
   │     ├─ injection? → reject
   │     ├─ secret? → reject
   │     ├─ untrusted source + semantic/procedural? → reject
-  │     └─ PII? → mark sensitive, optionally require confirmation
+  │     └─ PII? → redact unless confirmed
+  ├─ provenance: every derived_from id must exist for the same user
+  │     ├─ propagate taint from parents
+  │     └─ compute provenance_verified on the server
   ├─ extract candidates (LLM or heuristic)
   ├─ dedupe: exact normalized content or cosine ≥ threshold
   │     └─ if a candidate conflicts, do not merge; go to lifecycle
@@ -98,6 +115,12 @@ text
         ├─ supersede when trusted + confident (or explicit change)
         └─ record ConflictRecord
 ```
+
+The same policy runs on `POST /v1/memories`, `POST /v1/import` and
+`PATCH /v1/memories/{id}`. Import validates every record before writing any of
+them and cannot change an id's owner; a patch cannot promote an untrusted or
+tainted record to durable memory, edit `taint`/`provenance_verified`, or lower
+sensitivity.
 
 ### Why extraction is separate from writing
 
@@ -178,22 +201,29 @@ The guard runs on every write:
   sensitive; content is redactable; sensitive memories are excluded from
   retrieval by default (`include_sensitive=False`).
 - **Provenance (opt-in)**: agent writes must declare `derived_from`; taint
-  propagates from untrusted parents and blocks durable writes. This handles
-  trust laundering on the base set, but forged provenance is still a bypass;
-  signatures/attestation are future work. See MemPoison in
-  [POISON.md](POISON.md).
+  propagates from untrusted parents and blocks durable writes. With
+  `MEMORY_ATTESTATION_SECRET`, the write is signed; verification recomputes the
+  payload from stored state and recursively checks the parent chain. Forged,
+  missing or tampered parents are rejected. See
+  [ATTESTATION.md](ATTESTATION.md).
+- **Tenant boundary**: every memory, conflict and event carries `tenant_id`;
+  store queries are scoped by `(tenant_id, user_id)`, and a request for another
+  tenant is rejected.
+- **Audit chain**: every event binds `prev_hash` and `event_hash`; the chain is
+  per tenant and verified with `GET /v1/audit/verify`.
 
-This is a baseline, not a complete AI-safety system. See the roadmap for
-integrity checks and consensus voting.
+This is a baseline, not a complete AI-safety system. HMAC is a shared-secret
+MAC; Ed25519/transparency-log anchoring and consensus voting are future work.
 
 ## 8. Observability
 
 Two independent logs:
 
-1. **SQLite `events`**: durable audit of write/search/update/delete/merge/
-   maintenance, queryable via `recent_events`.
+1. **SQLite `events`**: durable, hash-chained audit of write/search/update/
+   delete/merge/maintenance, queryable via `recent_events`; verification
+   returns the first broken event id.
 2. **JSONL trace**: append-only, one line per operation, with timestamps and
-   structured fields; readable by `TraceLogger.read()` or any JSONL tool.
+   structured fields; content is fingerprinted, not stored verbatim.
 
 The trace is intentionally separate from the database so it can be shipped to a
 log store without changing the memory schema.

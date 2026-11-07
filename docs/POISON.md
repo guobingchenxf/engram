@@ -114,11 +114,12 @@ numbers should not be silently compared with LLM numbers.
 | `none` | safety disabled; all writes accepted | all memories injected |
 | `source_trust` | existing SafetyGuard trust policy | all accepted memories injected |
 | `classifier` | source trust + write-time poison classifier | all accepted memories injected |
-| `isolation` | safety disabled; all writes accepted | untrusted sources removed from context |
+| `isolation` | safety disabled; all writes accepted | untrusted records are filtered by source before scoring, not by matching rendered text |
 | `provenance` | source trust disabled; agent writes require trusted `derived_from`; tainted parents rejected | all accepted memories injected |
+| `attestation` | source trust + HMAC-SHA256 signed agent provenance; an agent write must carry a valid attestation and a signed parent chain | all accepted memories injected |
 
-Integrity checks, signatures and consensus voting are natural next conditions;
-they are not implemented yet and are not claimed in the results.
+Signed attestation is implemented in the production write path; consensus
+voting and public-key verification are the remaining extensions.
 
 ## 6. Metrics
 
@@ -148,26 +149,32 @@ Current leaderboard (120 cases, deterministic):
 | classifier | **5.0%** | 25.0% | **95.0%** | 25.0% | 90.0% | 1.30 |
 | isolation | 40.0% | 100.0% | 60.0% | 0.0% | 60.0% | 1.00 |
 | provenance | **10.0%** | 100.0% | 90.0% | 0.0% | 90.0% | 1.00 |
+| attestation | **0.0%** | **0.0%** | **100.0%** | 0.0% | 100.0% | 1.00 |
 
 ## 8. Findings
 
 1. **Source trust alone is insufficient.** It blocks direct untrusted writes, but
-   trust laundering gives the attacker a free pass: base ASR 40%, adaptive ASR
-   100%.
-2. **Retrieval isolation has the same blind spot.** It removes direct untrusted
-   lines from the context, but a laundered agent memory is indistinguishable
-   from a legitimate one.
-3. **A write-time classifier is the strongest general defense**, cutting base
-   ASR to 5%, but it rejects 25% of benign instruction-like memories and still
-   misses 25% of adaptive cases.
+   trust laundering gives the attacker a free pass: base ASR 33.3%, adaptive ASR
+   100% (all-120 ASR 40%).
+2. **Retrieval isolation has the same blind spot.** It filters untrusted
+   records structurally, but a laundered agent memory is indistinguishable from
+   a legitimate one.
+3. **A write-time classifier is a strong general defense**, cutting base ASR to
+   2.8% (all-120 5%), but it rejects 25% of benign instruction-like memories.
+   Its residual adaptive 25% is the `Tool output:` channel prefix satisfying the
+   simulator's `output` marker, not a real bypass.
 4. **Provenance is the best base-set defense but is not enough.** It reaches 0%
    ASR on the base set, yet every adaptive case forges a trusted parent and
    succeeds. Provenance must be signed/attested, not self-declared.
-5. **The right defense is layered.** Source trust prevents the easy path;
+5. **Signed attestation closes the forged-parent gap.** With
+   `require_attestation_for_agent`, both base and adaptive ASR are 0% because
+   the benchmark attacker has no trusted signing key. Key compromise is out of
+   scope; see [ATTESTATION.md](ATTESTATION.md).
+6. **The right defense is layered.** Source trust prevents the easy path;
    classification handles obvious poison; provenance constrains derivation;
-   integrity/signatures prevent forged provenance; audit and counterfactual
-   debugging explain failures after the fact.
-6. **No vendor comparison is claimed.** The benchmark measures defenses on a
+   attestation prevents forged provenance; audit and counterfactual debugging
+   explain failures after the fact.
+7. **No vendor comparison is claimed.** The benchmark measures defenses on a
    fixed synthetic corpus; it does not establish that Engram "beats Mem0/Zep".
 
 ## 9. Limitations
@@ -176,15 +183,16 @@ Current leaderboard (120 cases, deterministic):
   exists (`--victim llm`) but has not been run with a real provider.
 - A deterministic 20% held-out split and CSV annotation template exist, but the
   labels are empty. Do not call it human-annotated until two reviewers fill it.
-- Five defense conditions are implemented; integrity checks, signatures and
-  consensus voting are future work.
+- Six defense conditions are implemented; signed attestation is implemented,
+  while consensus voting and public-key verification are future work.
 - The dataset is small (120 cases) and uses templates; it is a starting point,
   not a leaderboard with vendor submissions yet.
 - No cross-lingual or multimodal injection channels yet.
 
 ## 10. Roadmap
 
-1. Add integrity checks (hash/signature of trusted writes) and consensus voting.
+1. Add Ed25519/public verification and consensus voting on top of the signed
+   attestation path.
 2. Run the LLM victim with a real provider and compare simulator vs model ASR.
 3. Have two humans label the held-out split; report Cohen's kappa.
 4. Add multi-turn tool-use traces (real agent trajectories) as a second dataset.

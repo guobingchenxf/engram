@@ -56,7 +56,13 @@ def test_stats_and_export(store: SQLiteMemoryStore) -> None:
     assert "embedding" in exported[0]
 
 
-def test_import_records(store: SQLiteMemoryStore) -> None:
-    source = MemoryRecord(user_id="u1", content="imported").model_dump(mode="json")
-    assert store.import_records([source]) == 1
-    assert len(store.list_memories("u1")) == 1
+def test_upsert_rejects_cross_user_overwrite(store: SQLiteMemoryStore) -> None:
+    source = MemoryRecord(user_id="u1", content="owned by u1")
+    store.upsert(source)
+    hijack = MemoryRecord(id=source.id, user_id="attacker", content="replaced")
+    with pytest.raises(ValueError, match="another tenant/user"):
+        store.upsert(hijack)
+    stored = store.get(source.id)
+    assert stored is not None
+    assert stored.user_id == "u1"
+    assert stored.content == "owned by u1"

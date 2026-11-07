@@ -25,6 +25,11 @@ def test_benchmark_report_shape() -> None:
     assert data["memory"]["aggregate"]["checks"] > 0
     assert data["no_memory"]["aggregate"]["checks"] > 0
     assert "check_pass_rate" in data["memory"]["aggregate"]
+    assert data["memory"]["aggregate"]["scenarios_passed"] == 23
+    assert data["memory"]["aggregate"]["checks_passed"] == 23
+    assert (
+        data["ablations"]["no_conflicts"]["aggregate"]["scenarios_passed"] < 23
+    )
     assert {"vector_only", "no_conflicts", "no_rerank", "no_sensitivity_filter"} <= set(
         data["ablations"]
     )

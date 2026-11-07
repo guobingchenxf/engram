@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -11,7 +12,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from .config import MemoryConfig
 from .debug import CounterfactualDebugger
-from .errors import MemoryNotFound, SafetyViolation
+from .errors import MemoryNotFound, SafetyViolation, TenantIsolationError
 from .models import (
     ConflictRecord,
     ExplainRequest,
@@ -28,20 +29,35 @@ from .viewer import render_explain_html, render_trace_html
 
 def create_app(config: MemoryConfig | None = None) -> FastAPI:
     service = MemoryService(config)
+    if service.config.require_auth and not service.config.api_key:
+        raise RuntimeError(
+            "MEMORY_API_KEY must be set when authentication is required. "
+            "Generate one with `python -c \"import secrets; "
+            "print(secrets.token_urlsafe(24))\"`, or set "
+            "MEMORY_REQUIRE_AUTH=false for a loopback-only development run."
+        )
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        try:
+            yield
+        finally:
+            service.close()
+
     app = FastAPI(
         title="Engram",
         version="0.1.0",
         description="A lifecycle-aware long-term memory layer for LLM agents.",
+        lifespan=lifespan,
     )
     app.state.service = service
 
-    # Development convenience only. Lock this down before exposing the API.
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    if service.config.cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(service.config.cors_origins),
+            allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+            allow_headers=["Content-Type", "X-API-Key"],
+        )
 
     @app.middleware("http")
     async def _api_key_middleware(request: Request, call_next: Any) -> Any:
@@ -68,9 +84,18 @@ def create_app(config: MemoryConfig | None = None) -> FastAPI:
             content={"error": "not_found", "detail": str(exc)},
         )
 
+    @app.exception_handler(TenantIsolationError)
+    async def _tenant_handler(
+        _request: Any, exc: TenantIsolationError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=403,
+            content={"error": "tenant_isolation", "detail": str(exc)},
+        )
+
     @app.get("/health")
     def health() -> dict[str, Any]:
-        return {"status": "ok", "db_path": service.config.db_path}
+        return {"status": "ok"}
 
     @app.post("/v1/memories", response_model=MemoryRecord)
     def write_memory(request: MemoryWriteRequest) -> MemoryRecord:
@@ -86,6 +111,7 @@ def create_app(config: MemoryConfig | None = None) -> FastAPI:
 
     @app.post("/v1/explain")
     def explain(request: ExplainRequest) -> dict[str, Any]:
+        service.assert_tenant(request.tenant_id)
         explanation = CounterfactualDebugger(service, request.user_id).explain(
             request.query,
             top_k=request.top_k,
@@ -103,7 +129,9 @@ def create_app(config: MemoryConfig | None = None) -> FastAPI:
         token_budget: int = 500,
         method: str = "leave_one_out",
         samples: int = 12,
+        tenant_id: str | None = None,
     ) -> str:
+        service.assert_tenant(tenant_id)
         explanation = CounterfactualDebugger(service, user_id).explain(
             query,
             top_k=top_k,
@@ -148,11 +176,13 @@ def create_app(config: MemoryConfig | None = None) -> FastAPI:
 
     @app.get("/v1/trace")
     def trace(limit: int = 100) -> list[dict[str, Any]]:
-        return service.trace.read(limit=limit)
+        return service.trace.read(limit=limit, tenant_id=service.tenant_id)
 
     @app.get("/v1/trace/view", response_class=HTMLResponse)
     def trace_view(limit: int = 200) -> str:
-        return render_trace_html(service.trace.read(limit=limit))
+        return render_trace_html(
+            service.trace.read(limit=limit, tenant_id=service.tenant_id)
+        )
 
     @app.get("/v1/export")
     def export(user_id: str | None = None) -> list[dict[str, Any]]:
@@ -162,7 +192,24 @@ def create_app(config: MemoryConfig | None = None) -> FastAPI:
     def import_records(records: list[dict[str, Any]]) -> dict[str, int]:
         return {"imported": service.import_records(records)}
 
+    @app.get("/v1/memories/{memory_id}/attestation")
+    def memory_attestation(memory_id: str) -> dict[str, Any]:
+        verdict = service.verify_record_attestation(memory_id)
+        if verdict is None:
+            raise HTTPException(status_code=404, detail="memory not found")
+        return verdict
+
+    @app.get("/v1/audit/head")
+    def audit_head() -> dict[str, Any]:
+        return service.audit_head()
+
+    @app.get("/v1/audit/verify")
+    def audit_verify() -> dict[str, Any]:
+        return service.verify_audit()
+
     return app
 
 
-app = create_app()
+def get_app() -> FastAPI:
+    """Uvicorn factory: `uvicorn --factory engram.api:get_app`."""
+    return create_app()
