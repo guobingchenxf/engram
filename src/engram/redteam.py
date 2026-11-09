@@ -3,6 +3,7 @@
 The suite tests the safety guard, not the LLM: each case declares whether a
 write should be allowed and, when allowed, what sensitivity it should carry.
 Run it in CI and after changing safety rules.
+
 """
 
 from __future__ import annotations
